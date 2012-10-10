@@ -1,0 +1,237 @@
+#!/bin/bash
+#:=============================================================================
+#:        File: mgn-logclean
+#:       Usage: mgn-logclean /path/to/magento/
+#: Description: Empties Magento's log, dataflow, and reporting tables
+#:     Version: 0.9.1
+#:      Author: Ben Nugent <bnugent@nexcess.net>
+#:     Created: 2011-04-16
+#:    Revision: 2011-09-18
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+##=============================================================================
+## Constants & Global Variables
+##=============================================================================
+progname=$(readlink -f $0)      # this script
+tables="dataflow_batch_import
+dataflow_batch_export
+log_customer
+log_quote
+log_summary
+log_summary_type
+log_url
+log_url_info
+log_visitor
+log_visitor_info
+log_visitor_online
+report_event
+report_compared_product_index
+report_viewed_product_index"
+
+##=============================================================================
+## Function Definitions
+##=============================================================================
+#@-- Function -----------------------------------------------------------------
+#@ NAME: usage
+#@ DESCRIPTION: Display usage information
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+usage ()
+{
+    cat <<-EOT
+Empties Magento's log, dataflow, and reporting tables
+USAGE: mgn-logclean /path/to/magento/
+OPTIONS:
+    none
+
+Report bugs to <bnugent@nexcess.net>
+EOT
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: status
+#@ DESCRIPTION: Display SysV-Init-like status notifications
+#@ PARAMETER 1: status - OK|FAILED|<other>
+#@-----------------------------------------------------------------------------
+status ()
+{
+    local _status="$1"
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK)
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_credentials
+#@ DESCRIPTION: Extracts Magento database credentials from local.xml file and
+#@              displays them in line separated by a whitespace.
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_credentials ()
+{
+    [ $# -ne 1 ] && return 1
+
+    local config_file="${1}/app/etc/local.xml"  # Magento local.xml config
+
+    if [ -r "$config_file" ]
+    then
+        local host=$(grep -m 1 host "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local user=$(grep -m 1 username "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local pass=$(grep -m 1 password "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local db=$(grep -m 1 dbname "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+    else
+        echo "Error reading config file: $config_file" >&2
+        return 1
+    fi
+
+    echo "$host $user $pass $db"
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_prefix
+#@ DESCRIPTION: Returns Magento db prefix from local.xml config
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_prefix ()
+{
+    [ $# -ne 1 ] && return 1
+
+    local config_file="${1}/app/etc/local.xml"
+
+    if [ -r "$config_file" ]
+    then
+        local prefix=$(grep -m 1 prefix "$config_file" | \
+            cut -d'[' -f 3 | cut -d']' -f 1)
+        if [[ "$prefix" =~ "table_prefix" ]]
+        then
+            prefix=""
+        fi
+    else
+        printf "Error reading file: $config_file" >&2
+        return 1
+    fi
+
+    echo "$prefix"
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: run_query
+#@ DESCRIPTION: Executes an SQL Query
+#@ PARAMETER 1: host - hostname or IP address of MySQL database server
+#@ PARAMETER 2: user - MySQL database username
+#@ PARAMETER 3: pass - Password for MySQL database user
+#@ PARAMETER 4: db - MySQL database name
+#@ PARAMETER 5: sql - SQL query to run
+#@-----------------------------------------------------------------------------
+run_query ()
+{
+    if [ $# -ne 5 ]
+    then
+        return 1
+    fi
+    
+    local host="$1"
+    local user="$2"
+    local pass="$3"
+    local db="$4"
+    local sql="$5"
+    local MYSQL=$(which mysql)  # path to mysql client binary
+    
+    echo $sql | $MYSQL \
+        --host=$host \
+        --user=$user \
+        --password=$pass \
+        $db
+}
+
+##=============================================================================
+## Main Program
+##=============================================================================
+# Print usage if no arguments given
+[ $# -lt 1 ] && usage && exit 255
+
+# Parse command line
+while getopts :h flag; do
+    case $flag in
+        h)
+            usage
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            exit 254
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+# verify operand exists and is a directory
+if [ -d "${1%/}" ]
+then
+    path=$(readlink -f "$1")   # (real)path to Magento
+else
+    echo "The path supplied is not a valid directory: $1"
+    exit 253
+fi
+
+# verify path is valid Magento root
+if [ ! -r ${path}/app/etc/local.xml ]
+then
+    echo "The path supplied is not a valid magento installation: $path"
+    exit 252
+fi
+
+# get database prefix
+prefix="$(mage_get_db_prefix $path)"
+
+# build query for truncate
+sql=""
+for table in $tables
+do
+    sql="$sql truncate table ${prefix}${table};"
+done 
+
+# build query for optimize
+# needed to free space immediately
+optsql=""
+for table in $tables
+do
+    optsql="${optsql}${prefix}${table}, "
+done
+optsql="OPTIMIZE TABLE ${optsql%,*};"
+
+# run query
+echo -n "Cleaning database tables..."
+if run_query $(mage_get_db_credentials $path) "$sql"
+then
+    status OK
+    echo -n "Freeing up space..."
+    if run_query $(mage_get_db_credentials $path) "$optsql" >/dev/null 2>&1
+    then
+        status OK
+        rm -f $progname
+        exit 0
+    else
+        status FAILED
+        exit 254
+    fi
+else
+    status FAILED
+    exit 255
+fi

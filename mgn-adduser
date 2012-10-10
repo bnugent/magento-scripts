@@ -1,0 +1,268 @@
+#!/bin/bash
+#:=============================================================================
+#:        File: mgn-adduser
+#:       Usage: mgn-adduser [-u user] path/to/magento/
+#: Description: Add an admin user (default: nexcess) to a magento installation.
+#:     Version: 0.9.1
+#:      Author: Ben Nugent <bnugent@nexcess.net>
+#:     Created: 2011-05-02
+#:    Revision: 2011-09-19
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+##=============================================================================
+## Constants & Global Variables
+##=============================================================================
+progname=$(readlink -f $0)      # this script
+user=nexcess                    # default username
+pass="$(mkpasswd -l 20)"        # autogenerate 20 char passwd
+#pass='foo'
+prefix=""
+
+##=============================================================================
+## Function Definitions
+##=============================================================================
+#@-- Function -----------------------------------------------------------------
+#@ NAME: usage
+#@ DESCRIPTION: Display usage information
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+usage ()
+{
+    cat <<-EOT
+Add an admin user to a magento installation.
+USAGE: mgn-adduser [-u user] /path/to/magento/
+OPTIONS:
+    -u  Specify alternate username (default: nexcess).
+
+Report bugs to <bnugent@nexcess.net>
+EOT
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: status
+#@ DESCRIPTION: Display SysV-Init-like status notifications
+#@ PARAMETER 1: status - OK|FAILED|<other>
+#@-----------------------------------------------------------------------------
+status ()
+{
+    local _status="$1"
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK)
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_credentials
+#@ DESCRIPTION: Extracts Magento database credentials from local.xml file and
+#@              displays them in line separated by a whitespace.
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_credentials ()
+{
+    [ $# -ne 1 ] && return 1
+
+    local config_file="${1}/app/etc/local.xml"  # Magento local.xml config
+
+    if [ -r "$config_file" ]
+    then
+        local host=$(grep -m 1 host "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local user=$(grep -m 1 username "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local pass=$(grep -m 1 password "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local db=$(grep -m 1 dbname "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+    else
+        echo "Error reading config file: $config_file" >&2
+        return 1
+    fi
+
+    echo "$host $user $pass $db"
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_prefix
+#@ DESCRIPTION: Returns Magento db prefix from local.xml config
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_prefix ()
+{
+    [ $# -ne 1 ] && return 1
+
+    local config_file="${1}/app/etc/local.xml"
+
+    if [ -r "$config_file" ]
+    then
+        local prefix=$(grep -m 1 prefix "$config_file" | \
+            cut -d'[' -f 3 | cut -d']' -f 1)
+        if [[ "$prefix" =~ "table_prefix" ]]
+        then
+            prefix=""
+        fi
+    else
+        printf "Error reading file: $config_file" >&2
+        return 1
+    fi
+
+    echo "$prefix"
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: run_query
+#@ DESCRIPTION: Executes an SQL Query
+#@ PARAMETER 1: host - hostname or IP address of MySQL database server
+#@ PARAMETER 2: user - MySQL database username
+#@ PARAMETER 3: pass - Password for MySQL database user
+#@ PARAMETER 4: db - MySQL database name
+#@ PARAMETER 5: sql - SQL query to run
+#@-----------------------------------------------------------------------------
+run_query ()
+{
+    if [ $# -ne 5 ]
+    then
+        return 1
+    fi
+
+    local host="$1"
+    local user="$2"
+    local pass="$3"
+    local db="$4"
+    local sql="$5"
+    local MYSQL=$(which mysql)  # path to mysql client binary
+
+    echo $sql | $MYSQL -N \
+        --host=$host \
+        --user=$user \
+        --password=$pass \
+        $db
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: verify_user
+#@ DESCRIPTION: Checks to see if user exists in Magento database and assigns
+#@              a unique user_id if it doesn't.
+#@ PARAMETER 1: user - the username to validate
+#@-----------------------------------------------------------------------------
+verify_user ()
+{
+    if [ $# -ne 1 ]
+    then
+        return 1
+    fi
+
+    local user="$1"
+    local sql="select username from ${prefix}admin_user 
+    where username='$user';"
+    local _user=$(run_query $(mage_get_db_credentials $path) "$sql")
+
+    if [[ "$_user" ]]
+    then
+        echo "ERROR: User $user already exists."
+        exit 1
+    else 
+        sql="select MAX(user_id) from ${prefix}admin_user;"
+        local _uid=$(run_query $(mage_get_db_credentials $path) "$sql")
+        id=$(( $_uid + 1 ))
+    fi
+    return 0
+}
+
+
+##=============================================================================
+## Main Program
+##=============================================================================
+# Print usage if no arguments given
+[ $# -lt 1 ] && usage && exit 255
+
+# Parse command line
+while getopts :u:h flag; do
+    case $flag in
+        u)
+            user="$OPTARG"
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            exit 254
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+# verify operand exists and is a directory
+if [ -d "${1%/}" ]
+then
+    path=$(readlink -f "$1")   # (real)path to Magento
+else
+    echo "The path supplied is not a valid directory: $1"
+    exit 253
+fi
+
+# verify path is valid Magento root
+if [ ! -r ${path}/app/etc/local.xml ]
+then
+    echo "The path supplied is not a valid magento installation: $path"
+    exit 252
+fi
+
+# get database prefix
+prefix="$(mage_get_db_prefix $path)"
+
+# verify user and get UID
+verify_user $user 
+
+# build sql
+user_sql="INSERT INTO ${prefix}admin_user (
+user_id ,firstname ,lastname ,email ,username ,
+password ,created ,modified ,logdate ,lognum ,
+reload_acl_flag ,is_active ,extra)
+VALUES ('$id' , 'Nexcess', 'Support', 'tech@nexcess.net',
+'$user', MD5( '$pass' ) , '0000-00-00 00:00:00', NULL , NULL ,
+'0', '0', '1', NULL);"
+role_sql="INSERT INTO ${prefix}admin_role (
+role_id ,parent_id ,tree_level ,sort_order ,role_type ,
+user_id ,role_name)
+VALUES (NULL , '1', '2', '0', 'U', '$id', 'Nexcess');"
+
+# add user
+echo -n "Adding $user user..."
+if run_query $(mage_get_db_credentials $path) "$user_sql"
+then
+    status OK
+    echo -n "Adding admin role..."
+    if run_query $(mage_get_db_credentials $path) "$role_sql"
+    then
+        status OK
+        echo
+        echo "You may now log in to Magento with the following credentials:"
+        echo "Username: $user"
+        echo "Password: $pass"
+        rm -f $progname
+        exit 0
+    else
+        status FAILED
+        echo "ERROR: failed to add role."
+        echo "$role_sql"
+        exit 255
+    fi
+else
+    status FAILED
+    echo "ERROR: failed to add user: $user"
+    echo "$user_sql"
+    exit 254
+fi

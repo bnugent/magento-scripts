@@ -1,0 +1,432 @@
+#!/bin/bash
+#:=============================================================================
+#:    Title: mgn-dbrepair
+#:     Date: 2011-04-15
+#:  Version: 2.1
+#:   Author: Benjamin Nugent <bnugent@nexcess.net>
+#:  Options: -h	print usage information
+#:			 -v	print version information
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+#set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+## Meta-Globals
+progname=${0##*/}
+description="Quick installer for fresh magento and the magento-db-repair-tool."
+usage="mgn-dbrepair [-h|-v] [VERSION]
+Install latest version or VERSION of Magento plus magento-db-repair-tool.php 
+into subdirectory of magento root.
+\t-h\tprints this message
+\t-v\tprints version information"
+date_created=2010-12-21
+last_updated=2011-04-15
+version=2.1
+author="Ben Nugent <bnugent@nexcess.net>"
+
+## Configuration Globals
+repair_dir="dbr"
+unix_user=
+
+## Standard Functions
+usage() #@ DESCRIPTION: print usage information
+{   #@ USAGE: usage
+    #@ RETURNS: usage metadata to stdout
+
+    printf "%s - %s\n" "$progname" "$description"
+    printf "USAGE: %b\n" "$usage"
+    printf "\n%s\n" "Report bugs to $author"
+}
+
+version()   #@ DESCRIPTION: print version information
+{   #@ USAGE: version
+    #@ RETURNS: version information to stdout
+
+    printf "%s version %s\n" "$progname" "$version"
+    printf "by %s, %d\n" "$author" "${last_updated%%-*}"
+}
+
+die()   #@ DESCRIPTION: print error message and exit with supplied exit code
+{   #@ USAGE: die STATUS [MESSAGE]
+    #@ RETURNS: error message to stderr
+
+    error=$1
+    shift
+    [ -n "$*" ] && printf "$progname: ERROR: %s\n" "$*" >&2
+    exit "$error"
+}
+
+status()    #@ DESCRIPTION: print init-like status notification
+{   #@ USAGE: status OK|FAILED|<other>
+    #@ RETURNS: formatted status message to stdout
+
+    local _status=$1
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK) 
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)  
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+
+secure_script() #@ DESCRIPTION: deletes this script
+{   #@ USAGE: secure_script
+    #@ RETURNS: 0 on success, 1 on failure
+
+    rm -f $progname
+    if ls ./${progname} &>/dev/null; then
+		printf "Error: I was unable to delete myself. Please remove this script manually.\n" >&2
+        return 1
+    else
+        return 0
+    fi
+}
+
+
+extract_tarball() #@ DESCRIPTION: extracts tar.gz and tgz archives to cwd
+{   #@ USAGE: extract_tarball FILE
+    #@ RETURNS: 0 on success, 1 on failure
+
+    if [ $# -ne 1 ]; then
+        printf "Error: ${0}: No filename given to extract." >&2
+        return 1
+    fi
+    
+    local _file="$1"
+
+    if tar --extract --ungzip --file $_file ; then
+        return 0
+    else 
+        return 1
+    fi
+}
+
+set_ownership() #@ DESCRIPTION: sets file and directory ownership
+{   #@ USAGE: set_ownership UNIX_USER
+    #@ RETURNS:
+    
+    if [ $# -ne 1 ]; then
+        printf "Error: ${0}: Unix user must not be null.\n" >&2
+        return 1
+    fi  
+
+    local _unix_user=$1
+    
+    if [ -e /etc/httpd/conf.d/suphp.conf ]; then
+        chown -R ${_unix_user}:${_unix_user} .
+    else
+        chown -R apache:${_unix_user} .
+    fi  
+    
+    return 0
+} 
+
+make_password() #@ DESCRIPTION: makes strong passwords
+{   #@ USAGE: make_password [RETURN_VAR]
+    #@ RETURNS: $password
+
+    local _pass_var=$1
+    local password=$(head -c 500 /dev/urandom | tr -dc a-z0-9A-Z | tr -d '0,o,O,1,i,I,l,5,s,S' | head -c 19)
+
+    if [ "$_pass_var" ]; then
+        eval _pass_var="'$password'"
+    else
+        printf "$password"
+    fi
+}
+
+## Mage Functions
+mage_get_latest_version_number() #@ DESCRIPTION: sets magento $version global
+{   #@ USAGE: mage_get_latest_version_number [RETURN_VAR]
+    #@ RETURNS: latest version number
+
+    local _result_var=$1
+    local _latest='1.5.0.1'
+    if [[ "$_result_var" ]]; then
+        eval $_result_var="'$_latest'"
+    else
+        printf "$_latest"
+    fi
+}
+
+mage_get_magento()  #@ DESCRIPTION: downloads VERSION from magentocommerce
+{   #@ USAGE: mage_get_magento [VERSION]
+    #@ RETURNS: 0 on success, 1 on failure
+    #@ REQUIRES: mage_get_latest_version_number()
+
+    local _version=${1:-`mage_get_latest_version_number`}
+    if [[ "$_version" ]]; then
+        if wget -q http://www.magentocommerce.com/downloads/assets/${_version}/magento-${_version}.tar.gz >/dev/null 2>&1; then
+			mage_filename="magento-${_version}.tar.gz"
+            return 0
+        else
+            return 1
+        fi
+    else
+        printf "Error: ${0}: VERSION cannot be null." >&2
+        exit 1
+    fi
+}
+
+mage_get_dbrepairtool() #@ DESCRIPTION: downloads magento-db-repair-tool from nexscript repo
+{   #@ USAGE: mage_get_dbrepairtool
+    #@ RETURNS: 0 on success, 1 on failure
+   
+    if wget -q http://nexscript.nexcess.net/scripts/magento-db-repair-tool-1.0.php.gz >/dev/null 2>&1 ; then
+        if gunzip ./magento-db-repair-tool-1.0.php.gz ; then
+            return 0
+        else
+            return 1
+        fi  
+    else
+        return 1
+    fi
+}
+
+mage_get_db_credentials()   #@ DESCRIPTION: returns the magento db credentials from app/etc/local.xml
+{   #@ USAGE: mage_get_db_credentials HOSTVAR USERVAR PASSVAR DBVAR
+    #@        creds=$(mage_get_db_credentials)
+    #@ RETURNS: hostname username password dbname
+    #@ REQUIRES: app/etc/local.xml exists and is readable
+
+    local _hostvar=$1
+    local _uservar=$2
+    local _passvar=$3
+    local _dbvar=$4
+    local nexstamp="_nex$(date +%y%m%d-%H%M%S)"
+
+    if [ -r app/etc/local.xml ]; then
+        local _db_host=$(grep host app/etc/local.xml | cut -d '[' -f 3 | cut -d ']' -f 1)
+        local _db_user=$(grep username app/etc/local.xml | cut -d '[' -f 3 | cut -d ']' -f 1)
+        local _db_pass=$(grep password app/etc/local.xml | cut -d '[' -f 3 | cut -d ']' -f 1)
+        local _db_name=$(grep dbname app/etc/local.xml | cut -d '[' -f 3 | cut -d ']' -f 1)
+    else
+        printf "Error reading file: app/etc/local.xml\n"
+        return 1
+    fi  
+
+        if [ $# -eq 4 ] && [ -n $_hostvar ]; then
+                eval $_hostvar="'$_db_host'"
+                eval $_uservar="'$_db_user'"
+                eval $_passvar="'$_db_pass'"
+                eval $_dbvar="'$_db_name'"
+        else
+                printf "%s %s %s %s" $_db_host $_db_user $_db_pass $_db_name
+        fi
+}
+
+mage_set_permissions() #@ DESCRIPTION: sets file and directory permissions
+{   #@ USAGE: mage_set_permissions
+    #@ RETURNS:
+   
+    if [ -f /etc/httpd/conf.d/suphp.conf ]; then
+        find . -type f -exec chmod 644 {} \; 
+        find . -type d -exec chmod 2711 {} \;
+        find var/ -type d -exec chmod 2755 {} \;
+        find media/ -type d -exec chmod 2755 {} \;
+        if [ -e ./pear ]; then
+            chmod 550 pear
+        else
+            chmod 550 mage
+        fi  
+    else  
+        find . -type f -exec chmod 664 {} \;
+        find . -type d -exec chmod 2771 {} \;
+        find var/ -type d -exec chmod 2775 {} \;
+        find media/ -type d -exec chmod 2775 {} \;
+        if [ -e ./pear ]; then
+            chmod 550 pear
+        else
+            chmod 550 mage
+        fi
+    fi
+	
+	return 0
+} 
+
+mage_cleanup() #@ DESCRIPTION: cleans up unnecessary files from magento root
+{   #@ USAGE: mage_cleanup
+    #@ RETURNS: 
+
+    rm -f index.php.sample .htaccess.sample php.ini.sample *.txt data.sql 2>/dev/null
+    return 0
+}
+
+mage_run_installer() #@ DESCRIPTION: runs install.php
+{   #@ USAGE: mage_run_installer DB_HOST DB_USER DB_PASS DB_NAME BASE_URL ADMIN_PASS
+    #@ RETURNS: 0 on success, 1 on failure
+
+    if [ $# -ne 6 ]; then
+        printf "Error: ${0}: Not enough parameters."
+        return 1
+    fi
+
+    local _db_host=$1
+    local _db_user=$2
+    local _db_pass=$3
+    local _db_name=$4
+    local _base_url=$5
+    local _admin_pass=$6
+
+    if /usr/bin/php-cli -f install.php -- --license_agreement_accepted "yes" --locale "en_US" --timezone "America/Detroit" --default_currency "USD" --db_host "$_db_host" --db_name "$_db_name" --db_user "$_db_user" --db_pass "$_db_pass" --url "$_base_url" --skip_url_validation --use_rewrites "yes" --use_secure "no"  --secure_base_url "" --use_secure_admin "no" --admin_firstname "Nexcess" --admin_lastname "Support" --admin_email "user@example.com" --admin_username "admin" --admin_password "$_admin_pass" ; then
+        return 0
+    else
+        printf "Error: ${0}: Failed running installer."
+		return 1
+    fi
+}
+
+
+## Script Functions
+prompt_dbr_config()	#@ DESCRIPTION: gather configuration data from user
+{	#@ USAGE: prompt_dbr_config
+	#@ RETURNS: 
+	#@ REQUIRES: 
+	
+	local _default_host=$1
+	local _default_user=$2
+	local _default_pass=$3
+	local _default_db=$4
+	
+	printf "\n Enter host[ $_default_host ]: "
+	read dbr_host
+	if [ -z $dbr_host ]; then
+		dbr_host=$_default_host
+	fi
+		
+	printf "Enter user[ $_default_user ]: "
+	read dbr_user
+	if [ -z $dbr_user ]; then
+		dbr_user=$_default_user
+	fi
+		
+	printf "Enter password[ $_default_pass ]: "
+	read dbr_pass
+	if [ -z $dbr_pass ]; then
+		dbr_pass=$_default_pass
+	fi
+	
+	printf "%s" "Enter clean database name: "
+	read dbr_db
+	if [ -z $dbr_db ]; then
+		printf "Error: ${0}: Database name cannot be empty.\n"
+		prompt_dbr_config $dbr_host $dbr_user $dbr_pass foo
+	fi
+	
+	printf "Enter store base URL: "
+	read base_url
+	if [ -z $base_url ]; then
+		printf "Error: ${0}: Base URL cannot be empty.\n"
+		prompt_dbr_config $dbr_host $dbr_user $dbr_pass $dbr_db
+	fi
+	
+	return 0		
+}
+
+print_instructions()
+{
+	printf "\n%s\n" "You may now open ${base_url}magento-db-repair-tool-1.0.php
+in your browser to complete the database repair."
+} 
+
+## Runtime Configuration
+optstring=:hv
+
+while getopts $optstring var; do
+    case $var in
+        h)	
+			usage
+            exit 1
+            ;;
+        v)	
+			version
+            exit 1
+            ;;
+        *)	
+			usage
+            die 1 "Unrecognized option"
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+## Main program body
+[ !-f app/etc/local.xml ] && die 1 "This must be run from the Magento root!"
+if [ $# -eq 1 ]; then
+	mage_version=$1
+else
+	mage_get_latest_version_number mage_version
+fi
+
+clear
+printf "%s\n" "Installing Magento $mage_version and Database Repair Tool."
+printf "%s\n\n" "To continue, you will need a blank database ready with a user assigned to it."
+printf "%s" "Do you wish to continue? [Y\\n] "
+read q_ready
+if [[ $q_ready = "n" || $q_ready = "N" ]]; then
+	printf "Script terminated by user.\n"
+	exit 0
+fi
+
+if prompt_dbr_config $(mage_get_db_credentials); then
+	printf "Changing to ${repair_dir}/ directory..."
+	if mkdir $repair_dir && cd $repair_dir ; then
+		status OK
+		printf "Downloading Magento $mage_version and the db-repair-tool..."
+		if mage_get_magento $mage_version ; then
+			if mage_get_dbrepairtool ; then
+				status OK
+				printf "Extracting files..."
+				if extract_tarball $mage_filename ; then
+					status OK
+					if mv magento/* magento/.htaccess . ; then
+						printf "Setting permissions..."
+						if set_ownership ${unix_user:-`whoami`} && mage_set_permissions ; then
+							status OK
+							mage_cleanup
+							printf "Running installer..."
+							if mage_run_installer $dbr_host $dbr_user $dbr_pass $dbr_db $base_url "$(make_password)"; then
+								status OK
+								if mv magento-db-repair-tool-1.0.php ../ && cd .. ; then
+									rm -rf ${repair_dir}
+									print_instructions
+									secure_script
+									exit 0
+								else
+									exit 7
+								fi
+							else
+								status FAILED
+								die 1 "Failed running installer."
+							fi
+						else
+							status FAILED
+							die 1 "Failed setting permissions."
+						fi
+					fi
+				else
+					status FAILED
+					die 1 "Failed extracting files."
+				fi
+			fi
+		else
+			status FAILED
+			die 1 "Failed downloading files."
+		fi
+	else
+		status FAILED
+		die 1 "Failed to create ${repair_dir}."
+	fi
+else
+	status FAILED
+	die 1 "Unknown failure."
+fi

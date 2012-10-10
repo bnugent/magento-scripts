@@ -1,0 +1,350 @@
+#!/bin/bash
+#:=============================================================================
+#:        File: mgn-cp
+#:       Usage: mgn-cp [-d] [-f] <source> [<dest>]
+#: Description: Copy a Magento installation from <source> to <dest>.
+#:     Version: 0.9.1
+#:      Author: Ben Nugent <bnugent@nexcess.net>
+#:     Created: 2010-10-11
+#:    Revision: 2011-09-22
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+##=============================================================================
+## Constants & Global Variables
+##=============================================================================
+progname=$(readlink -f $0)      # this script
+cp_flag=0                       # copy flag: 0=both; 1=db only; 2=fs only
+db_host=localhost               # default database host
+db_user=iworx
+db_pw="$(grep rootdsn ~iworx/iworx.ini | \
+    perl -wnl -e 'm|iworx:(.*)\@unix| and print "$1";')"
+
+##=============================================================================
+## Function Definitions
+##=============================================================================
+#@-- Function -----------------------------------------------------------------
+#@ NAME: usage
+#@ DESCRIPTION: Display usage information
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+usage ()
+{
+    cat <<-EOT
+Copy a Magento installation from <source> to <dest>
+USAGE: mgn-bk [-d] [-f] <source> [<dest>]
+OPTIONS:
+    -d  Copy database only.
+    -f  Copy files only.
+    Default: both
+
+Report bugs to <bnugent@nexcess.net>
+EOT
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: status
+#@ DESCRIPTION: Display SysV-Init-like status notifications
+#@ PARAMETER 1: status - OK|FAILED|<other>
+#@-----------------------------------------------------------------------------
+status ()
+{
+    local _status="$1"
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK)
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: copy_files
+#@ DESCRIPTION: Copy <source> directory to <destination> directory using 
+#@              tar-to-pipe to preserver hidden files and permissions.
+#@ PARAMETER 1: source - path to source directory
+#@ PARAMETER 2: dest - path to destination directory
+#@-----------------------------------------------------------------------------
+copy_files () 
+{ 
+    [ $# -ne 2 ] && return 1
+
+    local _src=$(readlink -f "$1")
+    local _dst=$(readlink -f "$2")
+    local TAR=$(which tar)
+
+    if [ -d $_src -a -d $_dst ]
+    then
+        $TAR --create --file - $_src | $TAR --directory $_dst --extract \
+            --preserve-permissions --file - 2>/dev/null
+        if [ $? -eq 1 ]
+        then
+            echo "ERROR: Error copying files." >&2
+            return 1
+        fi
+    else
+        echo "ERROR: $_src or $_dst is not a directory." >&2
+        return 1
+    fi
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: copy_database
+#@ DESCRIPTION: Copy <source database> to <destination database>. Destination
+#@              database must already exist.
+#@ PARAMETER 1: source_db - full name of source database
+#@ PARAMETER 2: dest_db - full name of destination database
+#@-----------------------------------------------------------------------------
+copy_database ()
+{
+    [ $# -ne 2 ] && return 1
+
+    read _host _src_user _src_pw _src_db <mage_get_db_credentials $srcpath
+    if [ "$_src_host" != "$db_host"]
+    then
+        db_host="$_src_host"
+        db_user="$_src_user"
+        db_pw="$_src_pw"
+    fi
+    if [ "$1" != "$_src_db" ]
+    then
+        echo "Database name provided ($1) does not match configured database\
+            name: $_src_db"
+        return 1
+    fi
+    local _dst_db="$2"
+    local _tmp_db=$(mktemp -q)
+    local MYSQLDUMP=$(which mysqldump)
+    local MYSQL=$(which mysql)
+
+    $MYSQLDUMP --quick --host=$db_host --user=$db_user --password=$db_pw \
+        $_src_db > $_tmp_db 2>/dev/null
+
+    [ !-s "$_tmp_db" ] && return 1
+
+    $MYSQL --host=$db_host --user=$db_user --password=$db_pw $_dest_db < \
+        $_tempdb 2>/dev/null
+
+    rm -f $_tempdb
+    return 0
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_credentials
+#@ DESCRIPTION: Extracts Magento database credentials from local.xml file and
+#@              displays them in line separated by a whitespace.
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_credentials ()
+{
+    [ $# -ne 1 ] && return 1
+
+    local config_file="${1}/app/etc/local.xml"  # Magento local.xml config
+
+    if [ -r "$config_file" ]
+    then
+        local host=$(grep -m 1 host "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local user=$(grep -m 1 username "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local pass=$(grep -m 1 password "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local db=$(grep -m 1 dbname "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+    else
+        echo "Error reading config file: $config_file" >&2
+        return 1
+    fi
+
+    echo "$host $user $pass $db"
+}
+
+## Interactive Functions
+prompt_db_credentials() #@ DESCRIPTION: obtain source and destination database info from user
+{   #@ USAGE: prompt_db_credentials [SOURCE_HOST SOURCE_USER SOURCE_PASS SOURCE_DB]
+    #@ RETURNS: source_host source_user source_pass source_db dest_host dest_user dest_pass dest_db
+
+    local _host=$1
+    local _user=$2
+    local _pass=$3
+    local _db=$4
+
+    printf "Enter source host[ $_host ]: "
+    read _s_host
+    if [ -z $_s_host ]; then
+        _s_host=$_host
+    fi
+    printf "Enter source username[ $_user ]: "
+    read _s_user
+    if [ -z $_s_user ]; then
+        _s_user=$_user
+    fi
+    printf "Enter source password[ $_pass ]: "
+    read _s_pass
+    if [ -z "$_s_pass" ]; then
+        _s_pass="$_pass"
+    fi
+    printf "Enter source database[ $_db ]: "
+    read _s_db
+    if [ -z $_s_db ]; then
+        _s_db=$_db
+    fi
+    printf "Enter destination host[ $_host ]: "
+    read _d_host
+    if [ -z $_d_host ]; then
+        _d_host=$_host
+    fi
+    printf "Enter destination user [ $_user ]: "
+    read _d_user
+    if [ -z $_d_user ]; then
+        _d_user=$_user
+    fi
+    printf "Enter destination password[ $_pass ]: "
+    read _d_pass
+    if [ -z "$_d_pass" ]; then
+        _d_pass="$_pass"
+    fi
+    printf "Enter destination database: "
+    read _d_db
+    if [ -z $_d_db ]; then
+        printf "Error: ${0}: Destination database cannot be empty.\n"
+        return 1
+    fi
+
+    #printf "%s %s %s %s %s %s %s %s" $_s_host $_s_user $_s_pass $_s_db $_d_host $_d_user $_d_pass $_d_db
+}
+## Script-specific Functions
+db_copy_wrapper()
+{
+    if prompt_db_credentials $(mage_get_db_credentials); then
+        printf "Copying $_s_db to $_d_db with the following credentials:\n"
+        printf "%-25s\n" "Source:"
+        printf "%-30s\n" $_s_host $_s_user $_s_pass $_s_db
+        printf "%-25s\n" "Destination:"
+        printf "%-30s\n" $_d_host $_d_user $_d_pass $_d_db
+        printf "Are you sure? [Y/n]"
+        read _dbq
+        if [[ $_dbq = "Y"  ||  $_dbq = "y" ]]; then
+            printf "Copying database..."
+            if db_copy $_s_host $_s_user $_s_pass $_s_db $_d_host $_d_user $_d_pass $_d_db ; then
+                status OK
+				return 0
+            else
+                status FAILED
+                die 1 "Failed while copying database."
+            fi
+        else
+            die 0 "User terminated copy."
+        fi
+    else
+        die 1 "Failed saving db credentials."
+    fi
+}
+
+##=============================================================================
+## Main Program
+##=============================================================================
+# Print usage if no arguments given
+[ $# -lt 1 ] && usage && exit 255
+
+# Parse command line
+while getopts :dfh flag; do
+    case $flag in
+        d)
+            cp_flag=1
+            ;;
+        f)
+            cp_flag=2
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            exit 254
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+# verify <source> exists and is a directory
+if [ -d "${1%/}" ]
+then
+    srcpath=$(readlink -f "$1")   # (real)path to Magento
+else
+    echo "The path supplied is not a valid directory: $1"
+    exit 253
+fi
+# do the same for <dest> unless we're copying db only
+if [ "$cp_flag" -ne 1 ]
+then
+    if [ -d "${2%/}" ]
+    then
+        srcpath=$(readlink -f "$2")   # (real)path to dest
+    else
+        echo "The path supplied is not a valid directory: $2"
+        exit 253
+    fi
+fi
+
+
+# verify path is valid Magento root
+if [ ! -r ${srcpath}/app/etc/local.xml ]
+then
+    echo "The path supplied is not a valid magento installation: $srcpath"
+    exit 252
+fi
+
+# copy files
+if [ "$cp_flag" -ne 1 ]
+then
+    echo -n "Copying files from $srcpath to $destpath..."
+    if [ copy_files $srcpath $destpath ]
+    then
+        status OK
+        if [ "$cp_flag" -ne 2 ]
+        then
+            if copy_database $sourcepath
+
+
+
+## Are we copying DB also?
+db_option="Y" # yes by default
+printf "Do you want to copy the database too? [Y/n] "
+read db_option
+
+## Copy Files
+if [[ $files_option = "Y"  ||  $files_option = "y" ]]; then
+	printf "Copying $src_dir to $dest_dir..."
+	if tar_copy $src_dir $dest_dir; then
+		status OK
+		if [ -e ./pear -a ! -e ./mage ]; then
+			printf "Downloading unserialize.php..."
+			if (cd $dest_dir; wget -q nexscript.nexcess.net/scripts/unserialize.php); then
+				status OK
+			else
+				status FAILED
+			fi
+		fi
+		rm -f ${dest_dir}/${progname} 2>/dev/null
+	else
+		status FAILED
+		die 1 "Failed while copying directories."
+	fi
+fi
+
+## Copy Database
+if [[ $db_option = "Y"  ||  $db_option = "y" ]]; then
+	db_copy_wrapper
+fi
+
+secure_script

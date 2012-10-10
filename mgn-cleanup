@@ -1,0 +1,216 @@
+#!/bin/bash
+#:=============================================================================
+#:        File: mgn-cleanup
+#:       Usage: mgn-cleanup /path/to/magento/
+#: Description: Fix ownership and permissions and remove unneeded files.
+#:     Version: 0.9.1
+#:      Author: Ben Nugent <bnugent@nexcess.net>
+#:     Created: 2011-04-16
+#:    Revision: 2011-11-09
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+#set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+##=============================================================================
+## Constants & Global Variables
+##=============================================================================
+progname=$(readlink -f $0)      # this script
+
+##=============================================================================
+## Function Definitions
+##=============================================================================
+#@-- Function -----------------------------------------------------------------
+#@ NAME: usage
+#@ DESCRIPTION: Display usage information
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+usage ()
+{
+    cat <<-EOT
+Fix ownership and permissions and remove unneeded files.
+USAGE: mgn-cleanup /path/to/magento/
+OPTIONS:
+    none 
+
+Report bugs to <bnugent@nexcess.net>
+EOT
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: status
+#@ DESCRIPTION: Display SysV-Init-like status notifications
+#@ PARAMETER 1: status - OK|FAILED|<other>
+#@-----------------------------------------------------------------------------
+status ()
+{
+    local _status="$1"
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK)
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: guess_user
+#@ DESCRIPTION: Try and detect user for chown
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+guess_user ()
+{
+    local _root=$path
+    _root=${_root#/}
+    _root=${_root%%/*}
+    case $_root in
+        chroot)
+            user=$(echo $path | cut -d'/' -f 4)
+            ;;
+        home)
+            user=$(echo $path | cut -d'/' -f 3)
+            ;;
+        *)
+            user="nobody"
+            ;;
+    esac
+    echo -n $user
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: set_ownership
+#@ DESCRIPTION: Change file and directory ownership based on detected user
+#@ PARAMETER 1: user - unix user/group
+#@-----------------------------------------------------------------------------
+set_ownership () 
+{
+    if [ $# -ne 1 ]; then
+        printf "Error: ${0}: You need to specify a unix user.\n" >&2
+        return 1
+    fi
+    local _user=$1
+    local CHOWN=$(which chown)
+    # check if suphp is enabled
+    if [ -e /etc/httpd/conf.d/suphp.conf ]; then
+        $CHOWN -R ${_user}:${_user} $path
+    else
+        $CHOWN -R apache:${_user} $path
+    fi
+
+    return 0
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: set_permissions
+#@ DESCRIPTION: Set file and directory permissions for Magento
+#@ PARAMATER 1: --
+#@-----------------------------------------------------------------------------
+set_permissions ()
+{
+    local CHMOD=$(which chmod)
+    local FIND=$(which find)
+    if [ -f /etc/httpd/conf.d/suphp.conf -o -f /etc/init.d/lsws ]
+    then
+        $FIND $path -type f -exec $CHMOD 644 {} +
+        $FIND $path -type d -exec $CHMOD 6711 {} +
+        $FIND ${path}/var/ -type d -exec $CHMOD 6755 {} +
+        $FIND ${path}/media/ -type d -exec $CHMOD 6755 {} +
+        if [ -e ${path}/pear ]; then
+            $CHMOD 550 ${path}/pear
+        elif [ -e ${path}/mage ]; then
+            $CHMOD 550 ${path}/mage
+        fi
+    else
+        $FIND $path -type f -exec $CHMOD 664 {} +
+        $FIND $path -type d -exec $CHMOD 6771 {} +
+        $FIND ${path}/var/ -type d -exec $CHMOD 6775 {} +
+        $FIND ${path}/media/ -type d -exec $CHMOD 6775 {} +
+        if [ -e ${path}/pear ]; then
+            $CHMOD 550 ${path}/pear
+        elif [ -e ${path}/mage ]; then
+            $CHMOD 550 ${path}/mage
+        fi
+    fi
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: clean_files
+#@ DESCRIPTION: Clean up unneeded files from Magento
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+clean_files ()
+{
+    local _GFILES="index.php.sample php.ini.sample RELEASE_NOTES.txt data.sql"
+    _GFILES="$_GFILES phpinfo.php pi.php php.php LICENSE*"
+    local RM=$(which rm)
+    RM="$RM --preserve-root"
+    cd $path &> /dev/null
+    $RM -f $_GFILES > /dev/null 2>&1
+    cd - &> /dev/null
+    return 0
+}
+
+##=============================================================================
+## Main Program
+##=============================================================================
+# Print usage if no arguments given
+[ $# -lt 1 ] && usage && exit 255
+
+# verify operand exists and is a directory
+if [ -d "${1%/}" ]
+then
+    path=$(readlink -f "$1")   # (real)path to Magento
+else
+    echo "The path supplied is not a valid directory: $1"
+    exit 253
+fi
+
+# verify path is valid Magento root
+if [ ! -r ${path}/app/etc/local.xml ]
+then
+    echo "The path supplied is not a valid magento installation: $path"
+    exit 252
+fi
+
+echo -n "Cleaning up unneeded files..."
+clean_files
+if [ $? = 0 ]
+then
+    status OK
+    echo -n "Attempting to guess unix user..."
+    echo -n "[";guess_user;echo -n "]..."
+    if [ "$user" ]
+    then
+        status OK
+        echo -n "Setting ownership..."
+        set_ownership $user
+        if [ $? = 0 ]
+        then
+            status OK
+            echo -n "Setting permissions..."
+            set_permissions
+            if [ $? = 0 ]
+            then
+                status OK
+                echo "$progname complete!"
+                exit 0
+            else
+                status FAILED
+                exit 255
+            fi
+        else
+            status FAILED
+            exit 255
+        fi
+    else
+        status FAILED
+        exit 255
+    fi
+else
+    status FAILED
+    exit 255
+fi

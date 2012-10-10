@@ -1,0 +1,246 @@
+#!/bin/bash
+#:=============================================================================
+#:        File: mgn-bk
+#:       Usage: mgn-bk [-d] [-f] /path/to/magento/
+#: Description: Backup a Magento installation.
+#:     Version: 0.9.1
+#:      Author: Ben Nugent <bnugent@nexcess.net>
+#:     Created: 2011-04-13
+#:    Revision: 2011-09-17
+#:=============================================================================
+#set -x # set -o xtrace  : print command traces before executing command
+set -u # set -o nounset : exits script if using unset variables
+set -e # set -o errexit : exits script if any statement returns non-true
+
+##=============================================================================
+## Constants & Global Variables
+##=============================================================================
+progname=$(readlink -f $0)      # this script
+bu_flag=0                       # backup flag: 0=both; 1=db only; 2=fs only
+timestamp=$(date +%Y%m%d-%H%M)  # timestamp YYYYMMDD-hhmm
+
+##=============================================================================
+## Function Definitions
+##=============================================================================
+#@-- Function -----------------------------------------------------------------
+#@ NAME: usage
+#@ DESCRIPTION: Display usage information
+#@ PARAMETER 1: --
+#@-----------------------------------------------------------------------------
+usage () 
+{   
+    cat <<-EOT
+Backup a Magento installation.
+USAGE: mgn-bk [-d] [-f] /path/to/magento/
+OPTIONS:
+    -d  Backup database only.
+    -f  Backup filesystem only.
+
+Report bugs to <bnugent@nexcess.net>
+EOT
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: status
+#@ DESCRIPTION: Display SysV-Init-like status notifications
+#@ PARAMETER 1: status - OK|FAILED|<other>
+#@-----------------------------------------------------------------------------
+status ()
+{
+    local _status="$1"
+    local _reset="\e[0m"
+    local _bldred="\e[1;31m"
+    local _bldgreen="\e[1;32m"
+
+    case $_status in
+        OK)
+            printf "%b\n" "[ $_bldgreen$_status$_reset ]"
+            ;;
+        FAILED)
+            printf "%b\n" "[ $_bldred$_status$_reset ]"
+            ;;
+        *)
+            printf "%s\n" "[ $_status ]"
+            ;;
+    esac
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: backup_db
+#@ DESCRIPTION: Dump database to bzip2 compressed file with timestamp
+#@ PARAMETER 1: host - hostname or IP address of database server
+#@ PARAMETER 2: user - MySQL database username
+#@ PARAMETER 3: pass - Password for MySQL database user
+#@ PARAMETER 4: db - MySQL database to back up
+#@-----------------------------------------------------------------------------
+backup_db ()
+{
+    if [ $# -ne 4 ]
+    then
+        echo "ERROR: Insufficient number of arguments passed to function: $0"
+        return 1
+    fi
+
+    echo -n "Backing up database..."
+
+    local host="$1"                 # hostname or IP addres of MySQL server
+    local user="$2"                 # MySQL database username
+    local pass="$3"                 # Password for MySQL user
+    local db="$4"                   # MySQL database name
+    local DUMP=$(which mysqldump)   # Path to mysqldump binary
+    local GZIP=$(which gzip)      # Path to bzip2 binary
+
+    cd $path
+    eval "$DUMP \
+        --quick \
+        --host=${host} \
+        --user=${user} \
+        --password=${pass} \
+        ${db} | $GZIP > ${db}.${timestamp}.sql.gz"
+    cd - >/dev/null 2>&1
+    return 0
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: backup_filesystem
+#@ DESCRIPTION: Create a compressed tarball of Magento installation
+#@ PARAMETER 1: path - path to Magento installation
+#@-----------------------------------------------------------------------------
+backup_filesystem ()
+{
+    [ $# -ne 1 ] && return 1
+
+    echo -n "Backing up files..."
+
+    local path="$1"             # Path to Magento installation
+    local TAR=$(which tar)      # Path to tar binary
+    local filename="${path##*/}.${timestamp}.tgz"  # backup filename
+    local cwd=$(pwd)            # Current directory of script
+
+    if [ "$cwd" == "$path" ]    # We don't want to create archive in the 
+    then                        # Magento root directory
+        cd ..
+    fi
+
+    $TAR czf $filename "$path" 2>/dev/null
+}
+#@-- Function -----------------------------------------------------------------
+#@ NAME: mage_get_db_credentials
+#@ DESCRIPTION: Extracts Magento database credentials from local.xml file and
+#@              displays them in line separated by a whitespace.
+#@ PARAMETER 1: path - path to Magento root directory
+#@-----------------------------------------------------------------------------
+mage_get_db_credentials ()
+{
+    [ $# -ne 1 ] && return 1    
+
+    local config_file="${1}/app/etc/local.xml"  # Magento local.xml config
+
+    if [ -r "$config_file" ]
+    then
+        local host=$(grep -m 1 host "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local user=$(grep -m 1 username "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local pass=$(grep -m 1 password "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+        local db=$(grep -m 1 dbname "$config_file" | \
+            cut -d '[' -f 3 | cut -d ']' -f 1)
+    else
+        echo "Error reading config file: $config_file" >&2
+        return 1
+    fi
+    
+    echo "$host $user $pass $db"
+}
+
+##=============================================================================
+## Main Program
+##=============================================================================
+# Print usage if no arguments given
+[ $# -lt 1 ] && usage && exit 255
+
+# Parse command line
+while getopts :dfh flag; do
+    case $flag in
+		d)
+			bu_flag=1
+			;;
+		f)
+			bu_flag=2
+			;;
+        h)
+            usage
+            exit 0
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            exit 254
+            ;;
+    esac
+done
+shift $(( $OPTIND - 1 ))
+
+# verify operand exists and is a directory
+if [ -d "${1%/}" ]
+then
+    path=$(readlink -f "$1")   # (real)path to Magento
+else
+    echo "The path supplied is not a valid directory: $1"
+    exit 253
+fi
+
+# verify path is valid Magento root
+if [ ! -r ${path}/app/etc/local.xml ]
+then
+    echo "The path supplied is not a valid magento installation: $path" 
+    exit 252
+fi
+
+case $bu_flag in 
+    0)  # default action: backup db and fs
+        backup_db $(mage_get_db_credentials "$path")
+        if [ $? -eq 0 ]
+        then
+            status OK
+        else
+            status FAILED
+            exit 251
+        fi
+        backup_filesystem "$path"
+        if [ $? -eq 0 ] 
+        then
+            status OK
+            rm -f $progname
+        else
+            status FAILED
+            exit 250
+        fi
+        ;;
+    1)  # backup database only
+        backup_db $(mage_get_db_credentials "$path")
+        if [ $? -eq 0 ]
+        then
+            status OK
+            rm -f $progname
+            exit 0
+        else
+            status FAILED
+            exit 251
+        fi
+        ;;
+    2)  # backup filesystem only
+        backup_filesystem "$path"
+        if [ $? -eq 0 ]
+        then
+            status OK
+            rm -f $progname
+            exit 0
+        else
+            status FAILED
+            exit 250
+        fi
+        ;;
+    *)  # this should never happen
+        echo "ERROR: Invalid backup flag: $bu_flag"
+        exit 249
+        ;;
+esac
